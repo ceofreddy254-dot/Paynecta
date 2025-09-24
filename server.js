@@ -1,35 +1,50 @@
-const express = require("express");
-const cors = require("cors");
-const axios = require("axios");
+import express from "express";
+import cors from "cors";
+import axios from "axios";
+import fetch from "node-fetch";
+import fs from "fs";
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// Allow your frontend origin only
-app.use(cors({
-  origin: "https://stupendous-salamander-117b97.netlify.app"
-}));
 app.use(express.json());
+app.use(cors({
+  origin: "https://your-frontend.netlify.app" // 🔧 change to your frontend domain
+}));
 
-// Hardcoded credentials (⚠️ remove later for security)
+// ===== PayNecta Credentials (⚠️ remove later for security) =====
 const API_KEY = "hmp_keozjmAk6bEwi0J2vaDB063tGwKkagHJtmnykFEh";
 const USER_EMAIL = "kipkoechabel69@gmail.com";
-const PAYMENT_LINK_CODE = "PNT_366813"; // 👈 from your dashboard
+const PAYMENT_LINK_CODE = "PNT_366813";
 
-// Health check
-app.get("/", (req, res) => {
-  res.json({ message: "PayNecta API proxy server is running" });
-});
+// ===== Statum Credentials (⚠️ remove later for security) =====
+const STATUM_KEY = "18885957c3a6cd14410aa9bfd7c16ba5273";
+const STATUM_SECRET = "sqPzmmybSXtQm7BJQIbz188vUR8P";
 
-// Initialize Payment (STK Push)
-app.post("/api/pay", async (req, res) => {
-  const { mobile_number, amount } = req.body;
+// === Utility: Generate Auth Header for Statum ===
+function getAuthHeader() {
+  const authString = `${STATUM_KEY}:${STATUM_SECRET}`;
+  const encoded = Buffer.from(authString).toString("base64");
+  return `Basic ${encoded}`;
+}
 
-  if (!mobile_number || !amount) {
-    return res.status(400).json({
-      success: false,
-      message: "Mobile number and amount are required"
-    });
+// === Utility: Logging ===
+function logToFile(filename, data) {
+  const logEntry = {
+    timestamp: new Date().toISOString(),
+    ...data,
+  };
+  fs.appendFileSync(filename, JSON.stringify(logEntry) + "\n", "utf8");
+}
+
+// =====================================
+// Step 1: Initiate STK Push (PayNecta)
+// =====================================
+app.post("/purchase", async (req, res) => {
+  const { phone_number, amount } = req.body;
+
+  if (!phone_number || !amount) {
+    return res.status(400).json({ success: false, message: "Phone number and amount are required" });
   }
 
   try {
@@ -37,7 +52,7 @@ app.post("/api/pay", async (req, res) => {
       "https://paynecta.co.ke/api/v1/payment/initialize",
       {
         code: PAYMENT_LINK_CODE,
-        mobile_number,
+        mobile_number: phone_number,
         amount
       },
       {
@@ -49,46 +64,68 @@ app.post("/api/pay", async (req, res) => {
       }
     );
 
-    res.json(response.data);
+    const payData = response.data;
+    logToFile("paynecta_init.log", payData);
+
+    // Respond to frontend
+    res.json({
+      success: true,
+      message: "STK push initiated. Await confirmation.",
+      data: payData.data
+    });
+
   } catch (error) {
-    console.error("Payment error:", error.response?.data || error.message);
-    res.status(error.response?.status || 500).json(
-      error.response?.data || { success: false, message: "Server error" }
-    );
+    console.error("PayNecta Init Error:", error.response?.data || error.message);
+    res.status(500).json({ success: false, message: "Failed to initiate STK push" });
   }
 });
 
-// Check Payment Status
-app.get("/api/status/:reference", async (req, res) => {
-  const { reference } = req.params;
+// =====================================
+// Step 2: PayNecta Callback Handler
+// =====================================
+app.post("/paynecta/callback", async (req, res) => {
+  const callbackData = req.body;
+  console.log("📩 PayNecta Callback:", callbackData);
+  logToFile("paynecta_callback.log", callbackData);
 
-  if (!reference) {
-    return res.status(400).json({
-      success: false,
-      message: "Transaction reference is required"
-    });
-  }
+  const { status, mobile_number, amount } = callbackData.data || {};
 
-  try {
-    const response = await axios.get(
-      `https://paynecta.co.ke/api/v1/payment/status?transaction_reference=${reference}`,
-      {
+  if (status === "success") {
+    try {
+      // Step 3: Send Airtime via Statum
+      const payload = { phone_number: mobile_number, amount: String(amount) };
+
+      const response = await fetch("https://api.statum.co.ke/api/v2/airtime", {
+        method: "POST",
         headers: {
-          "X-API-Key": API_KEY,
-          "X-User-Email": USER_EMAIL
-        }
-      }
-    );
+          "Authorization": getAuthHeader(),
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify(payload),
+      });
 
-    res.json(response.data);
-  } catch (error) {
-    console.error("Status error:", error.response?.data || error.message);
-    res.status(error.response?.status || 500).json(
-      error.response?.data || { success: false, message: "Server error" }
-    );
+      const result = await response.json();
+      console.log("📤 Airtime Topup Response:", result);
+      logToFile("airtime_requests.log", { request: payload, response: result });
+
+    } catch (err) {
+      console.error("❌ Airtime Error:", err);
+      logToFile("airtime_error.log", { error: err.message });
+    }
+  } else {
+    console.log(`❌ Payment ${status}. No airtime sent.`);
   }
+
+  res.json({ success: true });
+});
+
+// =====================================
+// Health check
+// =====================================
+app.get("/", (req, res) => {
+  res.json({ message: "✅ Airtime purchase server running" });
 });
 
 app.listen(PORT, () => {
-  console.log(`✅ Server running on port ${PORT}`);
+  console.log(`🚀 Server running on port ${PORT}`);
 });
