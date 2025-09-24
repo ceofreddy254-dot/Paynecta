@@ -5,29 +5,45 @@ const axios = require("axios");
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// ✅ Only allow your frontend origin
-const allowedOrigin = "https://peaceful-gumdrop-b26f6a.netlify.app";
-app.use(cors({ origin: allowedOrigin }));
-
+// Allow your frontend origin only
+app.use(cors({
+  origin: "https://peaceful-gumdrop-b26f6a.netlify.app"
+}));
 app.use(express.json());
 
-// 🔑 PayNecta API credentials (hardcoded for now)
-const PAYNECTA_BASE_URL = "https://paynecta.co.ke/api/v1";
-const PAYNECTA_API_KEY = "hmp_keozjmAk6bEwi0J2vaDB063tGwKkagHJtmnykFEh";
-const PAYNECTA_EMAIL = "kipkoechabel69@gmail.com";
+// Hardcoded credentials (⚠️ remove later for security)
+const API_KEY = "hmp_keozjmAk6bEwi0J2vaDB063tGwKkagHJtmnykFEh";
+const USER_EMAIL = "kipkoechabel69@gmail.com";
+const PAYMENT_LINK_CODE = "PNT_366813"; // 👈 from your dashboard
 
-// 🚀 Route: STK Push
-app.post("/stkpush", async (req, res) => {
+// Health check
+app.get("/", (req, res) => {
+  res.json({ message: "PayNecta API proxy server is running" });
+});
+
+// Initialize Payment (STK Push)
+app.post("/api/pay", async (req, res) => {
+  const { mobile_number, amount } = req.body;
+
+  if (!mobile_number || !amount) {
+    return res.status(400).json({
+      success: false,
+      message: "Mobile number and amount are required"
+    });
+  }
+
   try {
-    const { amount, phone, account_reference, transaction_desc, callback_url } = req.body;
-
     const response = await axios.post(
-      `${PAYNECTA_BASE_URL}/payments/stkpush`,
-      { amount, phone, account_reference, transaction_desc, callback_url },
+      "https://paynecta.co.ke/api/v1/payment/initialize",
+      {
+        code: PAYMENT_LINK_CODE,
+        mobile_number,
+        amount
+      },
       {
         headers: {
-          "X-API-Key": PAYNECTA_API_KEY,
-          "X-User-Email": PAYNECTA_EMAIL,
+          "X-API-Key": API_KEY,
+          "X-User-Email": USER_EMAIL,
           "Content-Type": "application/json"
         }
       }
@@ -35,38 +51,41 @@ app.post("/stkpush", async (req, res) => {
 
     res.json(response.data);
   } catch (error) {
-    console.error("❌ STK Error:", error.response?.data || error.message);
-    res.status(error.response?.status || 500).json({
-      status: "error",
-      message: error.response?.data?.message || error.message,
-      details: error.response?.data || null
-    });
+    console.error("Payment error:", error.response?.data || error.message);
+    res.status(error.response?.status || 500).json(
+      error.response?.data || { success: false, message: "Server error" }
+    );
   }
 });
 
-// 🚀 Route: Check Status
-app.get("/status/:id", async (req, res) => {
-  try {
-    const { id } = req.params;
+// Check Payment Status
+app.get("/api/status/:reference", async (req, res) => {
+  const { reference } = req.params;
 
+  if (!reference) {
+    return res.status(400).json({
+      success: false,
+      message: "Transaction reference is required"
+    });
+  }
+
+  try {
     const response = await axios.get(
-      `${PAYNECTA_BASE_URL}/payments/status/${id}`,
+      `https://paynecta.co.ke/api/v1/payment/status?transaction_reference=${reference}`,
       {
         headers: {
-          "X-API-Key": PAYNECTA_API_KEY,
-          "X-User-Email": PAYNECTA_EMAIL
+          "X-API-Key": API_KEY,
+          "X-User-Email": USER_EMAIL
         }
       }
     );
 
     res.json(response.data);
   } catch (error) {
-    console.error("❌ Status Error:", error.response?.data || error.message);
-    res.status(error.response?.status || 500).json({
-      status: "error",
-      message: error.response?.data?.message || error.message,
-      details: error.response?.data || null
-    });
+    console.error("Status error:", error.response?.data || error.message);
+    res.status(error.response?.status || 500).json(
+      error.response?.data || { success: false, message: "Server error" }
+    );
   }
 });
 
