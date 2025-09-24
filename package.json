@@ -1,7 +1,6 @@
 {
-  "name": "airtime-purchase-service",
+  "name": "airtime-backend",
   "version": "1.0.0",
-  "description": "Backend for Airtime purchase using PayNecta (STK push) + Statum (airtime)",
   "main": "server.js",
   "type": "module",
   "scripts": {
