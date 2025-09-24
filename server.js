@@ -6,7 +6,7 @@ const app = express();
 const PORT = process.env.PORT || 3000;
 
 // ✅ Only allow your frontend origin
-const allowedOrigin = "https://swiftloanfinance.onrender.com";
+const allowedOrigin = "https://peaceful-gumdrop-b26f6a.netlify.app";
 app.use(cors({ origin: allowedOrigin }));
 
 app.use(express.json());
@@ -16,7 +16,7 @@ const PAYNECTA_BASE_URL = "https://paynecta.co.ke/api/v1";
 const PAYNECTA_API_KEY = "hmp_keozjmAk6bEwi0J2vaDB063tGwKkagHJtmnykFEh";
 const PAYNECTA_EMAIL = "kipkoechabel69@gmail.com";
 
-// 🚀 Route: STK Push (initiate payment)
+// 🚀 Route: STK Push
 app.post("/stkpush", async (req, res) => {
   try {
     const { amount, phone, account_reference, transaction_desc, callback_url } = req.body;
@@ -35,16 +35,16 @@ app.post("/stkpush", async (req, res) => {
 
     res.json(response.data);
   } catch (error) {
-    console.error("❌ Error:", error.response?.data || error.message);
-    res.status(500).json({
+    console.error("❌ STK Error:", error.response?.data || error.message);
+    res.status(error.response?.status || 500).json({
       status: "error",
-      message: "Failed to initiate payment",
-      details: error.response?.data || error.message
+      message: error.response?.data?.message || error.message,
+      details: error.response?.data || null
     });
   }
 });
 
-// 🚀 Route: Check payment status
+// 🚀 Route: Check Status
 app.get("/status/:id", async (req, res) => {
   try {
     const { id } = req.params;
@@ -61,11 +61,11 @@ app.get("/status/:id", async (req, res) => {
 
     res.json(response.data);
   } catch (error) {
-    console.error("❌ Error:", error.response?.data || error.message);
-    res.status(500).json({
+    console.error("❌ Status Error:", error.response?.data || error.message);
+    res.status(error.response?.status || 500).json({
       status: "error",
-      message: "Failed to fetch payment status",
-      details: error.response?.data || error.message
+      message: error.response?.data?.message || error.message,
+      details: error.response?.data || null
     });
   }
 });
