@@ -9,7 +9,7 @@ const app = express();
 const PORT = process.env.PORT || 3000;
 
 app.use(express.json());
-app.use(cors({ origin: "https://delightful-daffodil-a8e0f4.netlify.app" })); // restrict in production
+app.use(cors({ origin: "https://wondrous-klepon-e7148c.netlify.app" }));
 
 // ===== Replace these with your real credentials =====
 const API_KEY = "hmp_keozjmAk6bEwi0J2vaDB063tGwKkagHJtmnykFEh";
@@ -19,15 +19,15 @@ const PAYMENT_LINK_CODE = "PNT_366813";
 const STATUM_KEY = "18885957c3a6cd14410aa9bfd7c16ba5273";
 const STATUM_SECRET = "sqPzmmybSXtQm7BJQIbz188vUR8P";
 
-// ===== Config for polling =====
-const POLL_INTERVAL_MS = 5000; // 5s
-const MAX_POLL_ATTEMPTS = 40;   // ~200s total (tweak as needed)
+// ===== Config =====
+const POLL_INTERVAL_MS = 5000;
+const MAX_POLL_ATTEMPTS = 40;  // ~200s
+const CLEANUP_TIMEOUT = 300000; // 5 minutes
 
 // Create logs dir if missing
 if (!fs.existsSync("logs")) fs.mkdirSync("logs");
 
-// Simple in-memory tracker for pending transactions
-// Structure: reference => { mobile, amount, attempts, status, airtime, processed, intervalId, startedAt }
+// In-memory tracker: reference → entry
 const pending = new Map();
 
 // === helpers ===
@@ -50,11 +50,10 @@ function normalizeStatus(status) {
   return "pending";
 }
 
-// send airtime to Statum (idempotent guarded outside)
+// === Statum airtime ===
 async function sendAirtime(phoneNumber, amount, reference) {
   try {
     const payload = { phone_number: phoneNumber, amount: String(amount) };
-
     console.log("➡️  Calling Statum:", payload);
     logToFile("airtime_attempt.log", { reference, payload });
 
@@ -72,7 +71,6 @@ async function sendAirtime(phoneNumber, amount, reference) {
     console.log("⬅️ Statum response:", result);
     logToFile("airtime_requests.log", { reference, request: payload, response: result });
 
-    // ✅ Fix: consider multiple success signals
     const ok =
       (result?.status_code && Number(result.status_code) === 200) ||
       result?.success === true ||
@@ -86,15 +84,10 @@ async function sendAirtime(phoneNumber, amount, reference) {
   }
 }
 
-// poller function for a specific transaction reference
+// === Poller ===
 async function pollTransaction(ref) {
   const entry = pending.get(ref);
-  if (!entry) return;
-
-  if (entry.processed) {
-    clearInterval(entry.intervalId);
-    return;
-  }
+  if (!entry || entry.processed) return;
 
   try {
     const resp = await axios.get(
@@ -117,15 +110,13 @@ async function pollTransaction(ref) {
       entry.processed = true;
       clearInterval(entry.intervalId);
 
-      // trigger airtime
       const { ok, result } = await sendAirtime(entry.mobile, entry.amount, ref);
       logToFile("poll_airtime_result.log", { ref, ok, result });
 
       entry.airtime = ok ? "success" : "failed";
       pending.set(ref, entry);
 
-      // auto clean after 1 minute
-      setTimeout(() => pending.delete(ref), 60000);
+      setTimeout(() => pending.delete(ref), CLEANUP_TIMEOUT);
       return;
     }
 
@@ -152,7 +143,7 @@ async function pollTransaction(ref) {
   }
 }
 
-// === API: initiate purchase ===
+// === /purchase ===
 app.post("/purchase", async (req, res) => {
   let { phone_number, amount } = req.body;
   if (!phone_number || !amount) {
@@ -214,7 +205,7 @@ app.post("/purchase", async (req, res) => {
   }
 });
 
-// === PayNecta webhook (optional but recommended) ===
+// === PayNecta callback ===
 app.post("/paynecta/callback", async (req, res) => {
   const callbackData = req.body;
   console.log("📩 PayNecta callback:", JSON.stringify(callbackData, null, 2));
@@ -247,7 +238,7 @@ app.post("/paynecta/callback", async (req, res) => {
       entry.airtime = ok ? "success" : "failed";
       pending.set(ref, entry);
 
-      setTimeout(() => pending.delete(ref), 60000);
+      setTimeout(() => pending.delete(ref), CLEANUP_TIMEOUT);
     } else if (["failed", "cancelled"].includes(normalized)) {
       clearInterval(entry.intervalId);
       pending.delete(ref);
@@ -258,7 +249,7 @@ app.post("/paynecta/callback", async (req, res) => {
   res.json({ success: true });
 });
 
-// === status route used by frontend (returns both payment + airtime) ===
+// === /api/status/:reference ===
 app.get("/api/status/:reference", async (req, res) => {
   const { reference } = req.params;
   if (pending.has(reference)) {
@@ -278,6 +269,7 @@ app.get("/api/status/:reference", async (req, res) => {
     );
     const payStatus = response.data;
     logToFile("paynecta_status.log", { reference, payStatus });
+
     const rawStatus = payStatus?.data?.status || payStatus?.status;
     let normalized = normalizeStatus(rawStatus);
 
@@ -293,7 +285,7 @@ app.get("/api/status/:reference", async (req, res) => {
   }
 });
 
-// === debug endpoints ===
+// === debug & health ===
 app.get("/pending", (req, res) => {
   const arr = [];
   for (const [k, v] of pending.entries()) {
@@ -302,7 +294,6 @@ app.get("/pending", (req, res) => {
   res.json({ success: true, pending: arr });
 });
 
-// logs viewer
 app.get("/logs/:type", (req, res) => {
   const filename = `logs/${req.params.type}.log`;
   if (!fs.existsSync(filename)) return res.status(404).json({ success: false, message: "log not found" });
@@ -312,7 +303,6 @@ app.get("/logs/:type", (req, res) => {
   res.json({ success: true, entries: lines });
 });
 
-// health
 app.get("/", (req, res) => res.json({ message: "✅ backend running" }));
 
 app.listen(PORT, () => console.log(`🚀 server listening on ${PORT}`));
