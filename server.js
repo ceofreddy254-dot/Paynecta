@@ -120,6 +120,59 @@ app.post("/paynecta/callback", async (req, res) => {
 });
 
 // =====================================
+// Step 3: Check Payment Status (for frontend polling)
+// =====================================
+app.get("/api/status/:reference", async (req, res) => {
+  const { reference } = req.params;
+
+  if (!reference) {
+    return res.status(400).json({ success: false, message: "Transaction reference is required" });
+  }
+
+  try {
+    const response = await axios.get(
+      `https://paynecta.co.ke/api/v1/payment/status?transaction_reference=${reference}`,
+      {
+        headers: {
+          "X-API-Key": API_KEY,
+          "X-User-Email": USER_EMAIL,
+        },
+      }
+    );
+
+    const payStatus = response.data;
+    logToFile("paynecta_status.log", payStatus);
+
+    // normalize status
+    let normalized = "pending";
+    const rawStatus =
+      payStatus?.data?.status?.toLowerCase?.() ||
+      payStatus?.status?.toLowerCase?.();
+
+    if (["success", "successful", "paid"].includes(rawStatus)) {
+      normalized = "success";
+    } else if (["failed", "fail", "cancelled", "declined"].includes(rawStatus)) {
+      normalized = "failed";
+    }
+
+    res.json({
+      success: true,
+      status: normalized,
+      reference,
+      raw: payStatus
+    });
+
+  } catch (error) {
+    console.error("Status error:", error.response?.data || error.message);
+    res.status(error.response?.status || 500).json({
+      success: false,
+      message: "Error checking status",
+      error: error.response?.data || error.message
+    });
+  }
+});
+
+// =====================================
 // Health check
 // =====================================
 app.get("/", (req, res) => {
