@@ -9,7 +9,7 @@ const app = express();
 const PORT = process.env.PORT || 3000;
 
 app.use(express.json());
-app.use(cors({ origin: "https://bright-kelpie-827386.netlify.app" })); // restrict in production
+app.use(cors({ origin: "https://gilded-crumble-6e303d.netlify.app" })); // restrict in production
 
 // ===== Replace these with your real credentials =====
 const API_KEY = "hmp_keozjmAk6bEwi0J2vaDB063tGwKkagHJtmnykFEh";
@@ -27,7 +27,7 @@ const MAX_POLL_ATTEMPTS = 40;   // ~200s total (tweak as needed)
 if (!fs.existsSync("logs")) fs.mkdirSync("logs");
 
 // Simple in-memory tracker for pending transactions
-// Structure: reference => { mobile, amount, attempts, status, processed, intervalId, startedAt }
+// Structure: reference => { mobile, amount, attempts, status, airtime, processed, intervalId, startedAt }
 const pending = new Map();
 
 // === helpers ===
@@ -72,11 +72,11 @@ async function sendAirtime(phoneNumber, amount, reference) {
     console.log("⬅️ Statum response:", result);
     logToFile("airtime_requests.log", { reference, request: payload, response: result });
 
-    // Accept both Statum-style numeric status_code === 200 OR result.success === true
+    // ✅ Fix: consider multiple success signals
     const ok =
       (result?.status_code && Number(result.status_code) === 200) ||
       result?.success === true ||
-      result?.status_code === 200;
+      String(result?.status).toLowerCase() === "success";
 
     return { ok, result };
   } catch (err) {
@@ -91,10 +91,8 @@ async function pollTransaction(ref) {
   const entry = pending.get(ref);
   if (!entry) return;
 
-  // If already processed, stop
   if (entry.processed) {
     clearInterval(entry.intervalId);
-    pending.delete(ref);
     return;
   }
 
@@ -116,48 +114,40 @@ async function pollTransaction(ref) {
     console.log(`Polling ${ref}: attempt=${entry.attempts} status=${normalized}`);
 
     if (normalized === "success") {
-      // mark processed to avoid duplicate airtime calls
       entry.processed = true;
       clearInterval(entry.intervalId);
-      pending.set(ref, entry); // update
 
-      // call Statum
+      // trigger airtime
       const { ok, result } = await sendAirtime(entry.mobile, entry.amount, ref);
-logToFile("poll_airtime_result.log", { ref, ok, result });
+      logToFile("poll_airtime_result.log", { ref, ok, result });
 
-// ✅ save airtime status before removing
-entry.airtime = ok ? "success" : "failed";
+      entry.airtime = ok ? "success" : "failed";
+      pending.set(ref, entry);
 
-// keep a record (could also archive instead of delete)
-pending.set(ref, entry);
-setTimeout(() => pending.delete(ref), 60000); // auto-clean after 1 min
+      // auto clean after 1 minute
+      setTimeout(() => pending.delete(ref), 60000);
       return;
     }
 
     if (["failed", "cancelled"].includes(normalized)) {
-      // final negative state
       clearInterval(entry.intervalId);
       pending.delete(ref);
       logToFile("paynecta_failure.log", { ref, status: normalized });
       return;
     }
 
-    // check max attempts
-    if ((entry.attempts || 0) >= MAX_POLL_ATTEMPTS) {
+    if (entry.attempts >= MAX_POLL_ATTEMPTS) {
       clearInterval(entry.intervalId);
       pending.delete(ref);
       logToFile("paynecta_timeout.log", { ref, attempts: entry.attempts });
-      return;
     }
   } catch (err) {
     console.error("❌ Poll error for", ref, err?.response?.data || err?.message || err);
     logToFile("poll_error.log", { ref, error: err?.response?.data || err?.message || String(err) });
     entry.attempts = (entry.attempts || 0) + 1;
-    // continue until MAX_POLL_ATTEMPTS
     if (entry.attempts >= MAX_POLL_ATTEMPTS) {
       clearInterval(entry.intervalId);
       pending.delete(ref);
-      logToFile("paynecta_timeout.log", { ref, attempts: entry.attempts });
     }
   }
 }
@@ -169,7 +159,6 @@ app.post("/purchase", async (req, res) => {
     return res.status(400).json({ success: false, message: "phone_number and amount required" });
   }
 
-  // ✅ Normalize phone format to 2547XXXXXXX
   if (phone_number.startsWith("07")) {
     phone_number = "254" + phone_number.slice(1);
   }
@@ -190,17 +179,16 @@ app.post("/purchase", async (req, res) => {
       init?.data?.data?.id;
 
     if (!transaction_reference) {
-      // Soft success — STK may still be sent
       return res.json({ success: true, message: "STK push initiated (no reference returned)", data: init.data });
     }
 
-    // ✅ create pending entry and start poller (unchanged)
     if (!pending.has(transaction_reference)) {
       const entry = {
         mobile: phone_number,
         amount,
         attempts: 0,
         status: "pending",
+        airtime: "pending",
         processed: false,
         intervalId: null,
         startedAt: Date.now()
@@ -218,7 +206,6 @@ app.post("/purchase", async (req, res) => {
     console.error("❌ PayNecta init error:", errorData);
     logToFile("paynecta_init_error.log", { error: errorData });
 
-    // ✅ Instead of failing hard, respond with soft success
     return res.json({
       success: true,
       message: "STK push may have been initiated — check your phone",
@@ -227,13 +214,12 @@ app.post("/purchase", async (req, res) => {
   }
 });
 
-// === PayNecta webhook (still supported) ===
+// === PayNecta webhook (optional but recommended) ===
 app.post("/paynecta/callback", async (req, res) => {
   const callbackData = req.body;
   console.log("📩 PayNecta callback:", JSON.stringify(callbackData, null, 2));
   logToFile("paynecta_callback.log", callbackData);
 
-  // Try to extract reference from common places
   const ref =
     callbackData?.data?.transaction_reference ||
     callbackData?.transaction_reference ||
@@ -247,7 +233,6 @@ app.post("/paynecta/callback", async (req, res) => {
 
   const normalized = normalizeStatus(statusRaw);
 
-  // If we have a pending entry, use it; otherwise log and optionally start send
   if (ref && pending.has(ref)) {
     const entry = pending.get(ref);
     entry.status = normalized;
@@ -255,54 +240,37 @@ app.post("/paynecta/callback", async (req, res) => {
     if (normalized === "success" && !entry.processed) {
       entry.processed = true;
       clearInterval(entry.intervalId);
-      // call Statum
-const { ok, result } = await sendAirtime(entry.mobile || mobile, entry.amount || amount, ref);
-logToFile("callback_airtime_result.log", { ref, ok, result });
 
-entry.airtime = ok ? "success" : "failed";
-pending.set(ref, entry);
-setTimeout(() => pending.delete(ref), 60000);
+      const { ok, result } = await sendAirtime(entry.mobile || mobile, entry.amount || amount, ref);
+      logToFile("callback_airtime_result.log", { ref, ok, result });
+
+      entry.airtime = ok ? "success" : "failed";
+      pending.set(ref, entry);
+
+      setTimeout(() => pending.delete(ref), 60000);
     } else if (["failed", "cancelled"].includes(normalized)) {
       clearInterval(entry.intervalId);
       pending.delete(ref);
       logToFile("callback_failure.log", { ref, status: normalized });
-    } else {
-      // pending - just update attempts/status
-      pending.set(ref, entry);
-    }
-  } else {
-    // No pending entry: handle gracefully — if success, trigger airtime once (idempotency: rely on Statum idempotency)
-    if (normalized === "success") {
-      // generate a ref for logging if not present
-      const logRef = ref || ("cb_" + Date.now());
-      logToFile("callback_no_pending.log", { logRef, status: normalized, mobile, amount });
-
-      // send airtime anyway (be careful in production — prefer only after verifying transaction server-side)
-      const { ok, result } = await sendAirtime(mobile, amount, logRef);
-      logToFile("callback_airtime_no_pending.log", { logRef, ok, result });
-    } else {
-      logToFile("callback_ignored.log", { status: normalized, raw: callbackData });
     }
   }
 
   res.json({ success: true });
 });
 
-// === status route used by frontend (returns normalized) ===
+// === status route used by frontend (returns both payment + airtime) ===
 app.get("/api/status/:reference", async (req, res) => {
   const { reference } = req.params;
-  // if it's in pending map, return that status
   if (pending.has(reference)) {
-  const entry = pending.get(reference);
-  return res.json({
-    success: true,
-    status: entry.status || "pending",    // PayNecta payment status
-    airtime: entry.airtime || "pending",  // Statum airtime delivery status
-    reference
-  });
-}
+    const entry = pending.get(reference);
+    return res.json({
+      success: true,
+      status: entry.status || "pending",
+      airtime: entry.airtime || "pending",
+      reference
+    });
+  }
 
-  // otherwise query PayNecta once
   try {
     const response = await axios.get(
       `https://paynecta.co.ke/api/v1/payment/status?transaction_reference=${encodeURIComponent(reference)}`,
@@ -311,15 +279,14 @@ app.get("/api/status/:reference", async (req, res) => {
     const payStatus = response.data;
     logToFile("paynecta_status.log", { reference, payStatus });
     const rawStatus = payStatus?.data?.status || payStatus?.status;
-let normalized = normalizeStatus(rawStatus);
+    let normalized = normalizeStatus(rawStatus);
 
-// ✅ fallback: if no status text but status_code=200, mark success
-if ((!rawStatus || normalized === "pending") &&
-    (payStatus?.data?.status_code === 200 || payStatus?.status_code === 200)) {
-  normalized = "success";
-}
+    if ((!rawStatus || normalized === "pending") &&
+        (payStatus?.data?.status_code === 200 || payStatus?.status_code === 200)) {
+      normalized = "success";
+    }
 
-return res.json({ success: true, status: normalized, reference, raw: payStatus });
+    return res.json({ success: true, status: normalized, airtime: "unknown", reference, raw: payStatus });
   } catch (err) {
     console.error("❌ Status lookup error:", err?.response?.data || err?.message || err);
     return res.status(500).json({ success: false, message: "Failed to check status", error: err?.response?.data || err?.message });
@@ -330,12 +297,12 @@ return res.json({ success: true, status: normalized, reference, raw: payStatus }
 app.get("/pending", (req, res) => {
   const arr = [];
   for (const [k, v] of pending.entries()) {
-    arr.push({ reference: k, mobile: v.mobile, amount: v.amount, attempts: v.attempts, status: v.status, startedAt: v.startedAt });
+    arr.push({ reference: k, mobile: v.mobile, amount: v.amount, attempts: v.attempts, status: v.status, airtime: v.airtime, startedAt: v.startedAt });
   }
   res.json({ success: true, pending: arr });
 });
 
-// logs viewer (last 50 lines)
+// logs viewer
 app.get("/logs/:type", (req, res) => {
   const filename = `logs/${req.params.type}.log`;
   if (!fs.existsSync(filename)) return res.status(404).json({ success: false, message: "log not found" });
