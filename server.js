@@ -7,7 +7,7 @@ const PORT = process.env.PORT || 3000;
 
 // Allow your frontend origin only
 app.use(cors({
-  origin: "https://peaceful-gumdrop-b26f6a.netlify.app"
+  origin: "https://stupendous-salamander-117b97.netlify.app"
 }));
 app.use(express.json());
 
