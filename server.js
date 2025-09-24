@@ -9,7 +9,7 @@ const app = express();
 const PORT = process.env.PORT || 3000;
 
 app.use(express.json());
-app.use(cors({ origin: "https://wondrous-klepon-e7148c.netlify.app" }));
+app.use(cors({ origin: "https://sprightly-dieffenbachia-8c081a.netlify.app" }));
 
 // ===== Replace these with your real credentials =====
 const API_KEY = "hmp_keozjmAk6bEwi0J2vaDB063tGwKkagHJtmnykFEh";
