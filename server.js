@@ -158,28 +158,49 @@ async function pollTransaction(ref) {
   }
 }
 
-// === API: initiate purchase ===
+//// === API: initiate purchase ===
 app.post("/purchase", async (req, res) => {
   const { phone_number, amount } = req.body;
-  if (!phone_number || !amount) return res.status(400).json({ success: false, message: "phone_number and amount required" });
+  if (!phone_number || !amount) {
+    return res.status(400).json({
+      success: false,
+      message: "phone_number and amount required",
+    });
+  }
 
   try {
     const init = await axios.post(
       "https://paynecta.co.ke/api/v1/payment/initialize",
       { code: PAYMENT_LINK_CODE, mobile_number: phone_number, amount },
-      { headers: { "X-API-Key": API_KEY, "X-User-Email": USER_EMAIL, "Content-Type": "application/json" } }
+      {
+        headers: {
+          "X-API-Key": API_KEY,
+          "X-User-Email": USER_EMAIL,
+          "Content-Type": "application/json",
+        },
+      }
     );
 
-    logToFile("paynecta_init.log", { request: { phone_number, amount }, response: init.data });
+    logToFile("paynecta_init.log", {
+      request: { phone_number, amount },
+      response: init.data,
+    });
 
-    // extract the transaction reference
-    const transaction_reference = init?.data?.data?.transaction_reference || init?.data?.data?.CheckoutRequestID || init?.data?.data?.reference || init?.data?.data?.id;
+    const transaction_reference =
+      init?.data?.data?.transaction_reference ||
+      init?.data?.data?.CheckoutRequestID ||
+      init?.data?.data?.reference ||
+      init?.data?.data?.id;
+
     if (!transaction_reference) {
-      // still return response but warn
-      return res.json({ success: true, message: "STK initiated", data: init.data });
+      return res.json({
+        success: true,
+        message: "STK initiated",
+        data: init.data?.data || init.data,
+      });
     }
 
-    // create pending entry and start poller
+    // track and start polling
     if (!pending.has(transaction_reference)) {
       const entry = {
         mobile: phone_number,
@@ -188,27 +209,36 @@ app.post("/purchase", async (req, res) => {
         status: "pending",
         processed: false,
         intervalId: null,
-        startedAt: Date.now()
+        startedAt: Date.now(),
       };
-      // start poll interval
-      const intervalId = setInterval(() => pollTransaction(transaction_reference), POLL_INTERVAL_MS);
+      const intervalId = setInterval(
+        () => pollTransaction(transaction_reference),
+        POLL_INTERVAL_MS
+      );
       entry.intervalId = intervalId;
       pending.set(transaction_reference, entry);
 
       logToFile("pending_added.log", { transaction_reference, entry });
-    } else {
-      logToFile("pending_exists.log", { transaction_reference });
     }
 
-    // return the PayNecta response to frontend so it can poll if needed
-    return res.json({ success: true, message: "STK push initiated", data: init.data?.data || init.data });
+    // ✅ return ONLY clean JSON
+    return res.json({
+      success: true,
+      message: "STK push initiated",
+      data: init.data?.data || init.data,
+    });
   } catch (err) {
-    console.error("❌ PayNecta init error:", err?.response?.data || err?.message || err);
-    logToFile("paynecta_init_error.log", { error: err?.response?.data || err?.message || String(err) });
-    return res.status(500).json({ success: false, message: "Failed to initiate STK push", error: err?.response?.data || err?.message });
+    console.error("❌ PayNecta init error:", err?.response?.data || err?.message);
+    logToFile("paynecta_init_error.log", {
+      error: err?.response?.data || err?.message,
+    });
+    return res.status(500).json({
+      success: false,
+      message: "Failed to initiate STK push",
+      error: err?.response?.data || err?.message,
+    });
   }
 });
-
 // === PayNecta webhook (still supported) ===
 app.post("/paynecta/callback", async (req, res) => {
   const callbackData = req.body;
