@@ -9,7 +9,7 @@ const app = express();
 const PORT = process.env.PORT || 3000;
 
 app.use(express.json());
-app.use(cors({ origin: "https://shimmering-squirrel-3e84f6.netlify.app" })); // restrict in production
+app.use(cors({ origin: "https://rainbow-creponne-4a9aeb.netlify.app" })); // restrict in production
 
 // ===== Replace these with your real credentials =====
 const API_KEY = "hmp_keozjmAk6bEwi0J2vaDB063tGwKkagHJtmnykFEh";
@@ -123,10 +123,14 @@ async function pollTransaction(ref) {
 
       // call Statum
       const { ok, result } = await sendAirtime(entry.mobile, entry.amount, ref);
-      logToFile("poll_airtime_result.log", { ref, ok, result });
+logToFile("poll_airtime_result.log", { ref, ok, result });
 
-      // keep a record and remove from pending
-      pending.delete(ref);
+// ✅ save airtime status before removing
+entry.airtime = ok ? "success" : "failed";
+
+// keep a record (could also archive instead of delete)
+pending.set(ref, entry);
+setTimeout(() => pending.delete(ref), 60000); // auto-clean after 1 min
       return;
     }
 
@@ -252,9 +256,12 @@ app.post("/paynecta/callback", async (req, res) => {
       entry.processed = true;
       clearInterval(entry.intervalId);
       // call Statum
-      const { ok, result } = await sendAirtime(entry.mobile || mobile, entry.amount || amount, ref);
-      logToFile("callback_airtime_result.log", { ref, ok, result });
-      pending.delete(ref);
+const { ok, result } = await sendAirtime(entry.mobile || mobile, entry.amount || amount, ref);
+logToFile("callback_airtime_result.log", { ref, ok, result });
+
+entry.airtime = ok ? "success" : "failed";
+pending.set(ref, entry);
+setTimeout(() => pending.delete(ref), 60000);
     } else if (["failed", "cancelled"].includes(normalized)) {
       clearInterval(entry.intervalId);
       pending.delete(ref);
@@ -286,9 +293,14 @@ app.get("/api/status/:reference", async (req, res) => {
   const { reference } = req.params;
   // if it's in pending map, return that status
   if (pending.has(reference)) {
-    const entry = pending.get(reference);
-    return res.json({ success: true, status: entry.status || "pending", reference });
-  }
+  const entry = pending.get(reference);
+  return res.json({
+    success: true,
+    status: entry.status || "pending",    // PayNecta payment status
+    airtime: entry.airtime || "pending",  // Statum airtime delivery status
+    reference
+  });
+}
 
   // otherwise query PayNecta once
   try {
@@ -299,8 +311,15 @@ app.get("/api/status/:reference", async (req, res) => {
     const payStatus = response.data;
     logToFile("paynecta_status.log", { reference, payStatus });
     const rawStatus = payStatus?.data?.status || payStatus?.status;
-    const normalized = normalizeStatus(rawStatus);
-    return res.json({ success: true, status: normalized, reference, raw: payStatus });
+let normalized = normalizeStatus(rawStatus);
+
+// ✅ fallback: if no status text but status_code=200, mark success
+if ((!rawStatus || normalized === "pending") &&
+    (payStatus?.data?.status_code === 200 || payStatus?.status_code === 200)) {
+  normalized = "success";
+}
+
+return res.json({ success: true, status: normalized, reference, raw: payStatus });
   } catch (err) {
     console.error("❌ Status lookup error:", err?.response?.data || err?.message || err);
     return res.status(500).json({ success: false, message: "Failed to check status", error: err?.response?.data || err?.message });
