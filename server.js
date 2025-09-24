@@ -9,7 +9,7 @@ const PORT = process.env.PORT || 3000;
 
 app.use(express.json());
 app.use(cors({
-  origin: "https://your-frontend.netlify.app" // 🔧 change to your frontend domain
+  origin: "https://leafy-manatee-53abab.netlify.app" // 🔧 change to your frontend domain
 }));
 
 // ===== PayNecta Credentials (⚠️ remove later for security) =====
