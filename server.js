@@ -9,7 +9,7 @@ const app = express();
 const PORT = process.env.PORT || 3000;
 
 app.use(express.json());
-app.use(cors({ origin: "https://gilded-crumble-6e303d.netlify.app" })); // restrict in production
+app.use(cors({ origin: "https://delightful-daffodil-a8e0f4.netlify.app" })); // restrict in production
 
 // ===== Replace these with your real credentials =====
 const API_KEY = "hmp_keozjmAk6bEwi0J2vaDB063tGwKkagHJtmnykFEh";
