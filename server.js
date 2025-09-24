@@ -1,3 +1,4 @@
+// server.js
 import express from "express";
 import cors from "cors";
 import axios from "axios";
@@ -8,136 +9,310 @@ const app = express();
 const PORT = process.env.PORT || 3000;
 
 app.use(express.json());
-app.use(cors({
-  origin: "https://rainbow-creponne-4a9aeb.netlify.app" // change to your frontend domain for production
-}));
+app.use(cors({ origin: "*" })); // restrict in production
 
-// ===== PayNecta Credentials =====
+// ===== Replace these with your real credentials =====
 const API_KEY = "hmp_keozjmAk6bEwi0J2vaDB063tGwKkagHJtmnykFEh";
 const USER_EMAIL = "kipkoechabel69@gmail.com";
 const PAYMENT_LINK_CODE = "PNT_366813";
 
-// ===== Statum Credentials =====
 const STATUM_KEY = "18885957c3a6cd14410aa9bfd7c16ba5273";
 const STATUM_SECRET = "sqPzmmybSXtQm7BJQIbz188vUR8P";
 
-// === Utility: Generate Auth Header for Statum ===
+// ===== Config for polling =====
+const POLL_INTERVAL_MS = 5000; // 5s
+const MAX_POLL_ATTEMPTS = 40;   // ~200s total (tweak as needed)
+
+// Create logs dir if missing
+if (!fs.existsSync("logs")) fs.mkdirSync("logs");
+
+// Simple in-memory tracker for pending transactions
+// Structure: reference => { mobile, amount, attempts, status, processed, intervalId, startedAt }
+const pending = new Map();
+
+// === helpers ===
+function logToFile(filename, data) {
+  const logEntry = { timestamp: new Date().toISOString(), ...data };
+  fs.appendFileSync(`logs/${filename}`, JSON.stringify(logEntry) + "\n", "utf8");
+}
+
 function getAuthHeader() {
   const authString = `${STATUM_KEY}:${STATUM_SECRET}`;
   return `Basic ${Buffer.from(authString).toString("base64")}`;
 }
 
-// === Utility: Log to File ===
-function logToFile(filename, data) {
-  const logEntry = {
-    timestamp: new Date().toISOString(),
-    ...data,
-  };
-  fs.appendFileSync(`logs/${filename}`, JSON.stringify(logEntry) + "\n", "utf8");
+function normalizeStatus(status) {
+  if (!status) return "pending";
+  const s = String(status).toLowerCase();
+  if (["success", "successful", "paid", "completed"].includes(s)) return "success";
+  if (["failed", "fail", "declined"].includes(s)) return "failed";
+  if (["cancelled", "canceled"].includes(s)) return "cancelled";
+  return "pending";
 }
 
-// Create logs dir if not exists
-if (!fs.existsSync("logs")) fs.mkdirSync("logs");
+// send airtime to Statum (idempotent guarded outside)
+async function sendAirtime(phoneNumber, amount, reference) {
+  try {
+    const payload = { phone_number: phoneNumber, amount: String(amount) };
 
-// =====================================
-// Step 1: Initiate STK Push (PayNecta)
-// =====================================
-app.post("/purchase", async (req, res) => {
-  const { phone_number, amount } = req.body;
+    console.log("➡️  Calling Statum:", payload);
+    logToFile("airtime_attempt.log", { reference, payload });
 
-  if (!phone_number || !amount) {
-    return res.status(400).json({ success: false, message: "Phone number and amount required" });
+    const resp = await fetch("https://api.statum.co.ke/api/v2/airtime", {
+      method: "POST",
+      headers: {
+        "Authorization": getAuthHeader(),
+        "Content-Type": "application/json",
+        "Accept": "application/json"
+      },
+      body: JSON.stringify(payload),
+    });
+
+    const result = await resp.json();
+    console.log("⬅️ Statum response:", result);
+    logToFile("airtime_requests.log", { reference, request: payload, response: result });
+
+    // Accept both Statum-style numeric status_code === 200 OR result.success === true
+    const ok =
+      (result?.status_code && Number(result.status_code) === 200) ||
+      result?.success === true ||
+      result?.status_code === 200;
+
+    return { ok, result };
+  } catch (err) {
+    console.error("❌ Statum call error:", err?.message || err);
+    logToFile("airtime_error.log", { error: String(err?.message || err) });
+    return { ok: false, result: { error: String(err?.message || err) } };
+  }
+}
+
+// poller function for a specific transaction reference
+async function pollTransaction(ref) {
+  const entry = pending.get(ref);
+  if (!entry) return;
+
+  // If already processed, stop
+  if (entry.processed) {
+    clearInterval(entry.intervalId);
+    pending.delete(ref);
+    return;
   }
 
   try {
-    const response = await axios.post(
-      "https://paynecta.co.ke/api/v1/payment/initialize",
-      { code: PAYMENT_LINK_CODE, mobile_number: phone_number, amount },
-      {
-        headers: {
-          "X-API-Key": API_KEY,
-          "X-User-Email": USER_EMAIL,
-          "Content-Type": "application/json"
-        }
-      }
-    );
-
-    logToFile("paynecta_init.log", response.data);
-    res.json(response.data);
-  } catch (error) {
-    console.error("❌ PayNecta Init Error:", error.response?.data || error.message);
-    res.status(500).json({ success: false, message: "Failed to initiate STK push" });
-  }
-});
-
-// =====================================
-// Step 2: PayNecta Callback Handler
-// =====================================
-app.post("/paynecta/callback", async (req, res) => {
-  const callbackData = req.body;
-  console.log("📩 PayNecta Callback:", callbackData);
-  logToFile("paynecta_callback.log", callbackData);
-
-  const { status, mobile_number, amount } = callbackData.data || {};
-  const normalized = (status || "").toLowerCase();
-
-  if (["success", "successful", "paid"].includes(normalized)) {
-    try {
-      // Step 3: Send Airtime via Statum
-      const payload = { phone_number: mobile_number, amount: String(amount) };
-
-      const response = await fetch("https://api.statum.co.ke/api/v2/airtime", {
-        method: "POST",
-        headers: {
-          "Authorization": getAuthHeader(),
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify(payload),
-      });
-
-      const result = await response.json();
-      console.log("📤 Airtime Response:", result);
-      logToFile("airtime_requests.log", { request: payload, response: result });
-
-    } catch (err) {
-      console.error("❌ Airtime Error:", err);
-      logToFile("airtime_error.log", { error: err.message });
-    }
-  } else {
-    console.log(`❌ Payment ${status}. No airtime sent.`);
-  }
-
-  res.json({ success: true });
-});
-
-// =====================================
-// Step 3: Poll Status from PayNecta
-// =====================================
-app.get("/api/status/:reference", async (req, res) => {
-  const { reference } = req.params;
-
-  try {
-    const response = await axios.get(
-      `https://paynecta.co.ke/api/v1/payment/status?transaction_reference=${reference}`,
+    const resp = await axios.get(
+      `https://paynecta.co.ke/api/v1/payment/status?transaction_reference=${encodeURIComponent(ref)}`,
       { headers: { "X-API-Key": API_KEY, "X-User-Email": USER_EMAIL } }
     );
-    res.json(response.data);
-  } catch (error) {
-    console.error("❌ Status Error:", error.response?.data || error.message);
-    res.status(500).json({ success: false, message: "Failed to fetch status" });
+
+    const payStatus = resp.data;
+    logToFile("paynecta_status.log", { ref, payStatus });
+
+    const rawStatus = payStatus?.data?.status || payStatus?.status;
+    const normalized = normalizeStatus(rawStatus);
+
+    entry.attempts = (entry.attempts || 0) + 1;
+    entry.status = normalized;
+
+    console.log(`Polling ${ref}: attempt=${entry.attempts} status=${normalized}`);
+
+    if (normalized === "success") {
+      // mark processed to avoid duplicate airtime calls
+      entry.processed = true;
+      clearInterval(entry.intervalId);
+      pending.set(ref, entry); // update
+
+      // call Statum
+      const { ok, result } = await sendAirtime(entry.mobile, entry.amount, ref);
+      logToFile("poll_airtime_result.log", { ref, ok, result });
+
+      // keep a record and remove from pending
+      pending.delete(ref);
+      return;
+    }
+
+    if (["failed", "cancelled"].includes(normalized)) {
+      // final negative state
+      clearInterval(entry.intervalId);
+      pending.delete(ref);
+      logToFile("paynecta_failure.log", { ref, status: normalized });
+      return;
+    }
+
+    // check max attempts
+    if ((entry.attempts || 0) >= MAX_POLL_ATTEMPTS) {
+      clearInterval(entry.intervalId);
+      pending.delete(ref);
+      logToFile("paynecta_timeout.log", { ref, attempts: entry.attempts });
+      return;
+    }
+  } catch (err) {
+    console.error("❌ Poll error for", ref, err?.response?.data || err?.message || err);
+    logToFile("poll_error.log", { ref, error: err?.response?.data || err?.message || String(err) });
+    entry.attempts = (entry.attempts || 0) + 1;
+    // continue until MAX_POLL_ATTEMPTS
+    if (entry.attempts >= MAX_POLL_ATTEMPTS) {
+      clearInterval(entry.intervalId);
+      pending.delete(ref);
+      logToFile("paynecta_timeout.log", { ref, attempts: entry.attempts });
+    }
+  }
+}
+
+// === API: initiate purchase ===
+app.post("/purchase", async (req, res) => {
+  const { phone_number, amount } = req.body;
+  if (!phone_number || !amount) return res.status(400).json({ success: false, message: "phone_number and amount required" });
+
+  try {
+    const init = await axios.post(
+      "https://paynecta.co.ke/api/v1/payment/initialize",
+      { code: PAYMENT_LINK_CODE, mobile_number: phone_number, amount },
+      { headers: { "X-API-Key": API_KEY, "X-User-Email": USER_EMAIL, "Content-Type": "application/json" } }
+    );
+
+    logToFile("paynecta_init.log", { request: { phone_number, amount }, response: init.data });
+
+    // extract the transaction reference
+    const transaction_reference = init?.data?.data?.transaction_reference || init?.data?.data?.CheckoutRequestID || init?.data?.data?.reference || init?.data?.data?.id;
+    if (!transaction_reference) {
+      // still return response but warn
+      return res.json({ success: true, message: "STK initiated", data: init.data });
+    }
+
+    // create pending entry and start poller
+    if (!pending.has(transaction_reference)) {
+      const entry = {
+        mobile: phone_number,
+        amount,
+        attempts: 0,
+        status: "pending",
+        processed: false,
+        intervalId: null,
+        startedAt: Date.now()
+      };
+      // start poll interval
+      const intervalId = setInterval(() => pollTransaction(transaction_reference), POLL_INTERVAL_MS);
+      entry.intervalId = intervalId;
+      pending.set(transaction_reference, entry);
+
+      logToFile("pending_added.log", { transaction_reference, entry });
+    } else {
+      logToFile("pending_exists.log", { transaction_reference });
+    }
+
+    // return the PayNecta response to frontend so it can poll if needed
+    return res.json({ success: true, message: "STK push initiated", data: init.data?.data || init.data });
+  } catch (err) {
+    console.error("❌ PayNecta init error:", err?.response?.data || err?.message || err);
+    logToFile("paynecta_init_error.log", { error: err?.response?.data || err?.message || String(err) });
+    return res.status(500).json({ success: false, message: "Failed to initiate STK push", error: err?.response?.data || err?.message });
   }
 });
 
-// =====================================
-// Step 4: Statum Callback (optional)
-// =====================================
-app.post("/statum/callback", (req, res) => {
-  console.log("📩 Statum Callback:", req.body);
-  logToFile("statum_callback.log", req.body);
+// === PayNecta webhook (still supported) ===
+app.post("/paynecta/callback", async (req, res) => {
+  const callbackData = req.body;
+  console.log("📩 PayNecta callback:", JSON.stringify(callbackData, null, 2));
+  logToFile("paynecta_callback.log", callbackData);
+
+  // Try to extract reference from common places
+  const ref =
+    callbackData?.data?.transaction_reference ||
+    callbackData?.transaction_reference ||
+    callbackData?.data?.CheckoutRequestID ||
+    callbackData?.data?.reference ||
+    callbackData?.reference;
+
+  const statusRaw = callbackData?.data?.status || callbackData?.status;
+  const mobile = callbackData?.data?.mobile_number || callbackData?.mobile_number || callbackData?.data?.msisdn;
+  const amount = callbackData?.data?.amount || callbackData?.amount;
+
+  const normalized = normalizeStatus(statusRaw);
+
+  // If we have a pending entry, use it; otherwise log and optionally start send
+  if (ref && pending.has(ref)) {
+    const entry = pending.get(ref);
+    entry.status = normalized;
+
+    if (normalized === "success" && !entry.processed) {
+      entry.processed = true;
+      clearInterval(entry.intervalId);
+      // call Statum
+      const { ok, result } = await sendAirtime(entry.mobile || mobile, entry.amount || amount, ref);
+      logToFile("callback_airtime_result.log", { ref, ok, result });
+      pending.delete(ref);
+    } else if (["failed", "cancelled"].includes(normalized)) {
+      clearInterval(entry.intervalId);
+      pending.delete(ref);
+      logToFile("callback_failure.log", { ref, status: normalized });
+    } else {
+      // pending - just update attempts/status
+      pending.set(ref, entry);
+    }
+  } else {
+    // No pending entry: handle gracefully — if success, trigger airtime once (idempotency: rely on Statum idempotency)
+    if (normalized === "success") {
+      // generate a ref for logging if not present
+      const logRef = ref || ("cb_" + Date.now());
+      logToFile("callback_no_pending.log", { logRef, status: normalized, mobile, amount });
+
+      // send airtime anyway (be careful in production — prefer only after verifying transaction server-side)
+      const { ok, result } = await sendAirtime(mobile, amount, logRef);
+      logToFile("callback_airtime_no_pending.log", { logRef, ok, result });
+    } else {
+      logToFile("callback_ignored.log", { status: normalized, raw: callbackData });
+    }
+  }
+
   res.json({ success: true });
 });
 
-// =====================================
-app.get("/", (req, res) => res.json({ message: "✅ Airtime backend running" }));
+// === status route used by frontend (returns normalized) ===
+app.get("/api/status/:reference", async (req, res) => {
+  const { reference } = req.params;
+  // if it's in pending map, return that status
+  if (pending.has(reference)) {
+    const entry = pending.get(reference);
+    return res.json({ success: true, status: entry.status || "pending", reference });
+  }
 
-app.listen(PORT, () => console.log(`🚀 Server running on port ${PORT}`));
+  // otherwise query PayNecta once
+  try {
+    const response = await axios.get(
+      `https://paynecta.co.ke/api/v1/payment/status?transaction_reference=${encodeURIComponent(reference)}`,
+      { headers: { "X-API-Key": API_KEY, "X-User-Email": USER_EMAIL } }
+    );
+    const payStatus = response.data;
+    logToFile("paynecta_status.log", { reference, payStatus });
+    const rawStatus = payStatus?.data?.status || payStatus?.status;
+    const normalized = normalizeStatus(rawStatus);
+    return res.json({ success: true, status: normalized, reference, raw: payStatus });
+  } catch (err) {
+    console.error("❌ Status lookup error:", err?.response?.data || err?.message || err);
+    return res.status(500).json({ success: false, message: "Failed to check status", error: err?.response?.data || err?.message });
+  }
+});
+
+// === debug endpoints ===
+app.get("/pending", (req, res) => {
+  const arr = [];
+  for (const [k, v] of pending.entries()) {
+    arr.push({ reference: k, mobile: v.mobile, amount: v.amount, attempts: v.attempts, status: v.status, startedAt: v.startedAt });
+  }
+  res.json({ success: true, pending: arr });
+});
+
+// logs viewer (last 50 lines)
+app.get("/logs/:type", (req, res) => {
+  const filename = `logs/${req.params.type}.log`;
+  if (!fs.existsSync(filename)) return res.status(404).json({ success: false, message: "log not found" });
+  const lines = fs.readFileSync(filename, "utf8").trim().split("\n").slice(-50).map(l => {
+    try { return JSON.parse(l); } catch { return l; }
+  });
+  res.json({ success: true, entries: lines });
+});
+
+// health
+app.get("/", (req, res) => res.json({ message: "✅ backend running" }));
+
+app.listen(PORT, () => console.log(`🚀 server listening on ${PORT}`));
